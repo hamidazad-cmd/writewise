@@ -1,41 +1,456 @@
-import re
+"""WriteWise - English Writing Analyzer.
+
+Usage:
+    python writewise.py                 # paste text, finish with Ctrl+D
+    python writewise.py essay.txt       # analyze a file
+    cat essay.txt | python writewise.py # analyze piped text
+    python writewise.py --history       # show previous reports
+"""
+
+import argparse
 import json
+import re
+import sys
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
+
+DEFAULT_ACADEMIC_FILE = "academic_words.txt"
+DEFAULT_REPORT_FILE = "reports.json"
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+STOP_WORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "and", "or", "but",
+    "of", "to", "in", "on", "for", "with", "this", "that", "these",
+    "those", "it", "its", "as", "at", "by", "has", "have", "had", "also",
+    "can", "will", "would", "should", "people", "using", "use",
+
+    # Additional common/function words
+    "not", "no", "yes",
+    "i", "me", "my", "mine", "myself",
+    "you", "your", "yours", "yourself", "yourselves",
+    "he", "him", "his", "himself",
+    "she", "her", "hers", "herself",
+    "we", "us", "our", "ours", "ourselves",
+    "they", "them", "their", "theirs", "themselves",
+
+    "be", "been", "being", "am",
+    "do", "does", "did", "done", "doing",
+    "could", "may", "might", "shall", "must",
+
+    "who", "whom", "whose", "which", "what",
+    "when", "where", "why", "how",
+
+    "then", "there", "here", "now",
+    "too", "only", "even", "still", "already", "again",
+
+    "from", "into", "onto", "over", "under",
+    "about", "around", "through", "between",
+    "among", "during", "before", "after",
+    "against", "without", "within", "toward",
+    "towards", "upon",
+
+    "person", "thing", "things",
+})
+
+FILLER_WORDS = frozenset({
+    "very", "really", "just", "basically", "actually", "literally",
+    "quite", "totally", "simply",
+})
+
+ABBREVIATIONS = frozenset({
+    "dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st", "vs",
+    "etc", "e.g", "i.e", "approx", "fig",
+})
+
+ACADEMIC_GOOD = 5
+ACADEMIC_LOW = 3
+ACADEMIC_EXCELLENT = 10
+
+IDEAL_MIN_LENGTH = 12
+IDEAL_MAX_LENGTH = 25
+SHORT_LENGTH = 8
+
+MAX_REPEATED = 5
+
+WORD_RE = re.compile(r"[a-zA-Z]+(?:'[a-zA-Z]+)?")
+
+# Protect common abbreviations and decimal numbers before sentence splitting.
+ABBREVIATION_RE = re.compile(
+    r"\b(" + "|".join(re.escape(word) for word in ABBREVIATIONS) + r")\.",
+    re.IGNORECASE,
+)
+
+DECIMAL_RE = re.compile(r"(?<=\d)\.(?=\d)")
 
 
-ACADEMIC_FILE = "academic_words.txt"
-REPORT_FILE = "reports.json"
+# ---------------------------------------------------------------------------
+# Text processing
+# ---------------------------------------------------------------------------
+
+def extract_words(text):
+    """Return lowercase words while keeping contractions intact."""
+    normalized = text.lower().replace("\u2019", "'")
+    return WORD_RE.findall(normalized)
 
 
-def main():
-    print("WriteWise - English Writing Analyzer")
-    print("-" * 40)
+def split_sentences(text):
+    """Split text into sentences while protecting abbreviations and decimals."""
+    text = text.strip()
 
-    print("Paste your writing:")
+    if not text:
+        return []
+
+    # Temporarily replace periods that should NOT end a sentence.
+    protected = ABBREVIATION_RE.sub(
+        lambda match: match.group(0).replace(".", "<DOT>"),
+        text,
+    )
+
+    protected = DECIMAL_RE.sub("<DOT>", protected)
+
+    chunks = re.split(r"(?<=[.!?])\s+", protected)
+
+    sentences = []
+
+    for chunk in chunks:
+        chunk = chunk.replace("<DOT>", ".").strip()
+
+        if WORD_RE.search(chunk):
+            sentences.append(chunk)
+
+    return sentences
+
+
+def count_syllables(word):
+    """Return a rough estimate of English syllables."""
+    word = word.lower().strip("'")
+
+    if not word:
+        return 0
+
+    count = len(re.findall(r"[aeiouy]+", word))
+
+    # Silent final 'e' in many English words.
+    if word.endswith("e") and not word.endswith("le") and count > 1:
+        count -= 1
+
+    return max(count, 1)
+
+
+def flesch_reading_ease(words, sentence_count):
+    """Calculate Flesch Reading Ease."""
+    if not words or sentence_count == 0:
+        return 0.0
+
+    syllables = sum(count_syllables(word) for word in words)
+
+    score = (
+        206.835
+        - 1.015 * (len(words) / sentence_count)
+        - 84.6 * (syllables / len(words))
+    )
+
+    return round(score, 1)
+
+
+def find_repeated_words(words):
+    """Find the most frequently repeated meaningful words."""
+    counter = Counter(
+        word
+        for word in words
+        if word not in STOP_WORDS and len(word) > 2
+    )
+
+    repeated = [
+        (word, count)
+        for word, count in counter.items()
+        if count > 1
+    ]
+
+    repeated.sort(key=lambda item: (-item[1], item[0]))
+
+    return repeated[:MAX_REPEATED]
+
+
+def find_filler_words(words):
+    """Find common filler words."""
+    counter = Counter(
+        word for word in words
+        if word in FILLER_WORDS
+    )
+
+    return sorted(
+        counter.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+
+
+def find_academic_words(words, academic_set):
+    """Find academic vocabulary and calculate its percentage."""
+    found = [word for word in words if word in academic_set]
+
+    percentage = (
+        round(len(found) / len(words) * 100, 2)
+        if words
+        else 0
+    )
+
+    return {
+        "count": len(found),
+        "percentage": percentage,
+        "words": sorted(set(found)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scoring and feedback
+# ---------------------------------------------------------------------------
+
+def calculate_score(academic_count, avg_length, repeated_count):
+    """Calculate the WriteWise score out of 100."""
+
+    # Vocabulary: 35 points
+    if academic_count >= ACADEMIC_EXCELLENT:
+        vocabulary_score = 35
+    elif academic_count >= ACADEMIC_GOOD:
+        vocabulary_score = 25
+    else:
+        vocabulary_score = 15
+
+    # Sentence structure: 35 points
+    if IDEAL_MIN_LENGTH <= avg_length <= IDEAL_MAX_LENGTH:
+        sentence_score = 35
+    else:
+        sentence_score = 20
+
+    # Repetition: 30 points
+    repetition_score = 30 if repeated_count == 0 else 20
+
+    return vocabulary_score + sentence_score + repetition_score
+
+
+def generate_feedback(results):
+    """Generate practical feedback based on analysis results."""
+    feedback = []
+
+    academic_count = results["academic_words"]["count"]
+    avg_length = results["average_sentence_length"]
+
+    # Academic vocabulary
+    if academic_count >= ACADEMIC_GOOD:
+        feedback.append("✓ Good use of academic vocabulary.")
+    elif academic_count < ACADEMIC_LOW:
+        feedback.append("⚠ Try adding more academic vocabulary.")
+
+    # Sentence length
+    if avg_length > IDEAL_MAX_LENGTH:
+        feedback.append(
+            "⚠ Some sentences are too long. Try splitting them."
+        )
+    elif avg_length >= IDEAL_MIN_LENGTH:
+        feedback.append(
+            "✓ Your sentences show good complexity."
+        )
+    elif 0 < avg_length < SHORT_LENGTH:
+        feedback.append(
+            "⚠ Your sentences are quite short. "
+            "Try combining some ideas."
+        )
+
+    # Repetition
+    if results["repeated_words"]:
+        word, count = results["repeated_words"][0]
+
+        feedback.append(
+            f"⚠ You repeat '{word}' often ({count} times). "
+            "Consider varying your vocabulary."
+        )
+
+    # Fillers
+    if results["filler_words"]:
+        fillers = ", ".join(
+            word for word, _ in results["filler_words"][:3]
+        )
+
+        feedback.append(
+            f"⚠ Consider cutting filler words: {fillers}."
+        )
+
+    if not feedback:
+        feedback.append(
+            "✓ No major issues detected by the current rules."
+        )
+
+    return feedback
+
+
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
+
+def analyze_text(text, academic_set=frozenset()):
+    """Analyze writing without performing file or console I/O."""
+    words = extract_words(text)
+    sentences = split_sentences(text)
+
+    sentence_count = len(sentences)
+
+    avg_length = (
+        round(len(words) / sentence_count, 2)
+        if sentence_count
+        else 0
+    )
+
+    repeated = find_repeated_words(words)
+
+    results = {
+        "words": len(words),
+        "sentences": sentence_count,
+        "average_sentence_length": avg_length,
+        "readability": flesch_reading_ease(
+            words,
+            sentence_count,
+        ),
+        "repeated_words": repeated,
+        "filler_words": find_filler_words(words),
+        "academic_words": find_academic_words(
+            words,
+            academic_set,
+        ),
+    }
+
+    results["score"] = calculate_score(
+        results["academic_words"]["count"],
+        avg_length,
+        len(repeated),
+    )
+
+    results["feedback"] = generate_feedback(results)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# File I/O
+# ---------------------------------------------------------------------------
+
+def load_academic_words(path):
+    """Load academic vocabulary from a text file."""
+    try:
+        with open(path, encoding="utf-8") as file:
+            return {
+                line.strip().lower()
+                for line in file
+                if line.strip()
+            }
+
+    except FileNotFoundError:
+        print(
+            f"⚠ Warning: '{path}' not found. "
+            "Academic vocabulary results and score "
+            "will be inaccurate.",
+            file=sys.stderr,
+        )
+
+        return set()
+
+    except OSError as error:
+        print(
+            f"⚠ Warning: Could not read '{path}': {error}",
+            file=sys.stderr,
+        )
+
+        return set()
+
+
+def read_input(file_path=None):
+    """Read writing from a file, stdin, or interactive input."""
+    if file_path:
+        return Path(file_path).read_text(encoding="utf-8")
+
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+
+    print("Paste your writing. Press Ctrl+D when finished:")
 
     lines = []
 
     while True:
-        line = input()
-
-        if line == "":
+        try:
+            line = input()
+        except EOFError:
             break
 
         lines.append(line)
 
-    text = "\n".join(lines)
+    return "\n".join(lines)
 
-    results = analyze_text(text)
 
+def load_reports(path):
+    """Load report history safely."""
+    try:
+        with open(path, encoding="utf-8") as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return data
+
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    except OSError as error:
+        print(
+            f"⚠ Warning: Could not read reports: {error}",
+            file=sys.stderr,
+        )
+
+    return []
+
+
+def save_report(results, path, reports):
+    """Append a report to the report history."""
+    reports.append({
+        "date": datetime.now().isoformat(timespec="seconds"),
+        "results": results,
+    })
+
+    try:
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(
+                reports,
+                file,
+                indent=4,
+                ensure_ascii=False,
+            )
+
+    except OSError as error:
+        print(
+            f"⚠ Warning: Could not save report: {error}",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def print_report(results, previous_score=None):
+    """Print a complete analysis report."""
     print("\nREPORT")
     print("-" * 40)
 
     print(f"Words: {results['words']}")
     print(f"Sentences: {results['sentences']}")
     print(
-        f"Average sentence length: "
+        "Average sentence length: "
         f"{results['average_sentence_length']} words"
+    )
+    print(
+        f"Readability (Flesch): {results['readability']}"
     )
 
     print("\nRepeated words:")
@@ -51,251 +466,148 @@ def main():
     print("\nAcademic Vocabulary:")
     print(f"Academic words used: {academic['count']}")
     print(
-        f"Academic vocabulary percentage: "
+        "Academic vocabulary percentage: "
         f"{academic['percentage']}%"
     )
 
     if academic["words"]:
         print("Words found:")
+
         for word in academic["words"]:
             print(f"- {word}")
     else:
         print("None")
 
-    score = calculate_score(results)
+    print(f"\nWriting Score: {results['score']}/100")
 
-    print(f"\nWriting Score: {score}/100")
+    if previous_score is not None:
+        diff = results["score"] - previous_score
+        sign = "+" if diff > 0 else ""
+
+        print(
+            f"Previous score: {previous_score}/100 "
+            f"({sign}{diff})"
+        )
 
     print("\nFeedback:")
 
     for item in results["feedback"]:
         print(f"- {item}")
 
-    save_report(results)
+
+def print_history(reports):
+    """Print previous writing scores."""
+    if not reports:
+        print("No reports found.")
+        return
+
+    print("\nWRITING HISTORY")
+    print("-" * 40)
+
+    for report in reports:
+        date = report.get("date", "Unknown date")
+        results = report.get("results", {})
+        score = results.get("score", "N/A")
+        words = results.get("words", "N/A")
+
+        print(
+            f"{date} | Score: {score}/100 | "
+            f"Words: {words}"
+        )
 
 
-def analyze_text(text):
-    words = extract_words(text)
+# ---------------------------------------------------------------------------
+# Command-line arguments
+# ---------------------------------------------------------------------------
 
-    results = {
-        "words": len(words),
-        "sentences": count_sentences(text),
-        "average_sentence_length": average_sentence_length(text),
-        "repeated_words": find_repeated_words(words),
-        "academic_words": find_academic_words(words)
-    }
-
-    results["feedback"] = generate_feedback(results)
-
-    return results
-
-
-def extract_words(text):
-    return re.findall(r"[a-zA-Z]+", text.lower())
-
-
-def count_sentences(text):
-    return len(re.findall(r"[.!?]", text))
-
-
-def average_sentence_length(text):
-    sentences = count_sentences(text)
-
-    if sentences == 0:
-        return 0
-
-    return round(len(extract_words(text)) / sentences, 2)
-
-
-def find_repeated_words(words):
-
-    stop_words = {
-        "the", "a", "an", "is", "are", "was", "were",
-        "and", "or", "but", "of", "to", "in", "on",
-        "for", "with", "this", "that", "these", "those",
-        "it", "its", "as", "at", "by",
-        "has", "have", "had", "also",
-        "can", "will", "would", "should",
-        "people", "using", "use"
-    }
-
-    counter = Counter(words)
-
-    repeated = []
-
-    for word, count in counter.items():
-
-        if word not in stop_words and count > 1:
-            repeated.append((word, count))
-
-    repeated.sort(
-        key=lambda x: x[1],
-        reverse=True
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="WriteWise - English Writing Analyzer"
     )
 
-    return repeated[:5]
+    parser.add_argument(
+        "file",
+        nargs="?",
+        help="text file to analyze",
+    )
+
+    parser.add_argument(
+        "--academic",
+        default=DEFAULT_ACADEMIC_FILE,
+        help="academic word list file",
+    )
+
+    parser.add_argument(
+        "--reports",
+        default=DEFAULT_REPORT_FILE,
+        help="where to store report history",
+    )
+
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="don't save this report",
+    )
+
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        help="show previous report history",
+    )
+
+    return parser.parse_args()
 
 
-def load_academic_words():
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
+def main():
+    args = parse_args()
+
+    print("WriteWise - English Writing Analyzer")
+    print("-" * 40)
+
+    reports = load_reports(args.reports)
+
+    # History mode
+    if args.history:
+        print_history(reports)
+        return
+
+    # Read input
     try:
-        with open(ACADEMIC_FILE) as file:
+        text = read_input(args.file)
 
-            return {
-                word.strip().lower()
-                for word in file
-                if word.strip()
-            }
+    except (FileNotFoundError, UnicodeDecodeError, OSError) as error:
+        sys.exit(f"Could not read input: {error}")
 
-    except FileNotFoundError:
+    # Validate input
+    if not extract_words(text):
+        sys.exit("No text to analyze.")
 
-        return set()
+    # Analyze
+    academic_set = load_academic_words(args.academic)
+    results = analyze_text(text, academic_set)
 
+    # Previous score
+    previous_score = None
 
-def find_academic_words(words):
+    if reports:
+        previous_results = reports[-1].get("results", {})
 
-    academic = load_academic_words()
+        if isinstance(previous_results, dict):
+            previous_score = previous_results.get("score")
 
-    found = [
-        word
-        for word in words
-        if word in academic
-    ]
+    # Display
+    print_report(results, previous_score)
 
-    return {
-        "count": len(found),
-        "percentage": round(
-            (len(found) / len(words)) * 100, 2
-        ) if words else 0,
-        "words": sorted(set(found))
-    }
-
-
-def generate_feedback(results):
-
-    feedback = []
-
-    if results["academic_words"]["count"] >= 5:
-
-        feedback.append(
-            "✓ Good use of academic vocabulary."
-        )
-
-
-    if results["average_sentence_length"] >= 10:
-
-        feedback.append(
-            "✓ Your sentences show good complexity."
-        )
-
-
-    if results["average_sentence_length"] > 25:
-
-        feedback.append(
-            "⚠ Some sentences are too long. "
-            "Try splitting them."
-        )
-
-
-    if results["repeated_words"]:
-
-        word = results["repeated_words"][0][0]
-
-        feedback.append(
-            f"⚠ You repeat '{word}' often. "
-            "Try using synonyms."
-        )
-
-
-    if results["academic_words"]["count"] < 3:
-
-        feedback.append(
-            "⚠ Try adding more academic vocabulary."
-        )
-
-
-    return feedback
-
-
-
-def calculate_score(results):
-
-    score = 0
-
-
-    # Vocabulary
-    if results["academic_words"]["count"] >= 10:
-
-        score += 35
-
-    elif results["academic_words"]["count"] >= 5:
-
-        score += 25
-
-    else:
-
-        score += 15
-
-
-    # Sentence structure
-    length = results["average_sentence_length"]
-
-    if 12 <= length <= 25:
-
-        score += 35
-
-    else:
-
-        score += 20
-
-
-    # Repetition
-
-    if len(results["repeated_words"]) == 0:
-
-        score += 30
-
-    else:
-
-        score += 20
-
-
-    return score
-
-
-
-def save_report(results):
-
-    report = {
-
-        "date": str(datetime.now()),
-
-        "results": results
-
-    }
-
-
-    try:
-
-        with open(REPORT_FILE) as file:
-
-            reports = json.load(file)
-
-
-    except (FileNotFoundError, json.JSONDecodeError):
-
-        reports = []
-
-
-    reports.append(report)
-
-
-    with open(REPORT_FILE, "w") as file:
-
-        json.dump(
+    # Save
+    if not args.no_save:
+        save_report(
+            results,
+            args.reports,
             reports,
-            file,
-            indent=4
         )
 
 
